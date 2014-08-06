@@ -9,8 +9,7 @@
 	"columns": [
 	    "timestamp[aggr=lquantize,step=600,field=time,date]",
 	    "hostname",
-	    "jobid",
-	    "owner",
-	    "serverUuid"
+	    "jobId",
+	    "owner"
 	]
 }
