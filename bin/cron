@@ -1,4 +1,7 @@
 #!/bin/bash
 
+start=$(date)
+echo "$start starting"
 export PATH=$PATH:$PWD/../dragnet/dragnet/bin
-$(dirname $BASH_SOURCE[0])/crank -d 1 -f
+$(dirname $BASH_SOURCE[0])/crank -d 2 -f
+echo "$(date) done (started at $start)"
