@@ -1,0 +1,14 @@
+{
+	"dataroot": "/poseidon/stor/logs/muskie",
+	"indexroot": "/poseidon/stor/dragnet/muskie0",
+	"timeformat": "%Y/%m/%d/%H",
+	"filter": { "eq": [ "audit", true ] },
+	"columns": [
+	    "timestamp[aggr=lquantize,step=600,field=time,date]",
+	    "hostname",
+	    "operation",
+	    "req.caller.login",
+	    "res.statusCode",
+	    "latency[aggr=quantize]"
+	]
+}

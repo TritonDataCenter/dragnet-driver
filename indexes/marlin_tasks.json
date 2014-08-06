@@ -1,0 +1,16 @@
+{
+	"dataroot": "/poseidon/stor/logs/marlin-agent",
+	"indexroot": "/poseidon/stor/dragnet/marlin.tasks0",
+	"timeformat": "%Y/%m/%d/%H",
+	"filter": {
+	    "and": [ { "eq": [ "computeAudit", true ] },
+	             { "eq": [ "event", "TaskDone" ] } ]
+	},
+	"columns": [
+	    "timestamp[aggr=lquantize,step=600,field=time,date]",
+	    "hostname",
+	    "jobid",
+	    "owner",
+	    "serverUuid"
+	]
+}

@@ -1,0 +1,407 @@
+#!/usr/bin/env node
+/* vim: set syn=javascript: */
+
+var mod_assert = require('assert');
+var mod_bunyan = require('bunyan');
+var mod_child = require('child_process');
+var mod_fs = require('fs');
+var mod_lstream = require('lstream');
+var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
+var mod_manta = require('manta');
+var mod_path = require('path');
+var mod_vasync = require('vasync');
+
+var format = require('util').format;
+var VError = require('verror');
+
+var cArg0 = mod_path.basename(process.argv[1]);
+var cIndexes = {};
+var cWork = [];
+var cLog;
+var cManta;
+var cDaysBack = 7;
+var cJobConcurrency = 5;
+
+function main()
+{
+	var option, parser, indexdir, indexname;
+	var dryrun, noconfirm, v;
+
+	parser = new mod_getopt.BasicParser(
+	    'c:(concurrency)d:(days-back)f(skip-confirm)n(dry-run)',
+	    process.argv);
+	while ((option = parser.getopt()) !== undefined) {
+		switch (option.option) {
+		case 'c':
+			v = parseInt(option.optarg, 10);
+			if (isNaN(v) || v <= 0)
+				fatal(new VError(
+				    'argument for -c is invalid: "%s"',
+				    option.optarg));
+			cJobConcurrency = v;
+			break;
+
+		case 'd':
+			v = parseInt(option.optarg, 10);
+			if (isNaN(v) || v <= 0)
+				fatal(new VError(
+				    'argument for -d is invalid: "%s"',
+				    option.optarg));
+			cDaysBack = v;
+			break;
+
+		case 'f':
+			noconfirm = true;
+			break;
+
+		case 'n':
+			dryrun = true;
+			break;
+
+		default:
+			/* error message already emitted */
+			mod_assert.equal('?', option.option);
+			usage();
+			break;
+		}
+	}
+
+	if (parser.optind() < process.argv.length) {
+		if (parser.optind() > process.argv.length) {
+			console.error('%s: extra arguments', cArg0);
+			usage();
+		}
+
+		indexname = process.argv[parser.optind()];
+	}
+
+	indexdir = mod_path.join(__dirname, '..', 'indexes');
+	cLog = new mod_bunyan({ 'name': cArg0 });
+	cManta = mod_manta.createBinClient({
+	    'log': cLog.child({ 'component': 'manta' })
+	});
+	/* Bad, manta client! */
+	process.removeAllListeners('uncaughtException');
+
+	crank({
+	    'indexdir': indexdir,
+	    'dryrun': dryrun,
+	    'noconfirm': noconfirm,
+	    'indexname': indexname || null
+	});
+}
+
+function crank(args)
+{
+	var indexdir, dryrun, noconfirm, indexname;
+
+	indexdir = args.indexdir;
+	dryrun = args.dryrun;
+	noconfirm = args.noconfirm;
+	indexname = args.indexname;
+
+	mod_vasync.waterfall([
+	    function listLocalIndexes(callback) {
+		if (indexname === null)
+			mod_fs.readdir(indexdir, callback);
+		else
+			setImmediate(callback, null, [ indexname + '.json' ]);
+	    },
+
+	    function processIndexes(entries, callback) {
+		mod_vasync.forEachParallel({
+		    'func': checkIndex.bind(null, indexdir),
+		    'inputs': entries
+		}, function (err) {
+			callback(err);
+		});
+	    },
+
+	    function compileWork(callback) {
+		for (var idx in cIndexes)
+			idxCompileWork(idx, cIndexes[idx]);
+		callback();
+	    },
+
+	    function doConfirm(callback) {
+		console.error('Commands to execute:');
+		doAllWork(true, function () {
+			if (dryrun || noconfirm) {
+				callback(null, true);
+				if (dryrun)
+					console.error('Leave off ' +
+					    '-n/--dry-run to execute');
+				return;
+			}
+
+			confirm('Do you want to run these jobs? (y/n) ',
+			    function (result) { callback(null, result); });
+		});
+	    },
+
+	    function doWork(proceed, callback) {
+		if (!proceed || dryrun) {
+			setImmediate(callback);
+			return;
+		}
+
+		doAllWork(dryrun, callback);
+	    }
+	], function (err) {
+		if (err)
+			fatal(err);
+		cManta.close();
+	});
+}
+
+function fatal(err)
+{
+	console.error('%s: %s', cArg0, err.message);
+	process.exit(1);
+}
+
+function usage()
+{
+	console.error('usage: %s [-c concurrency] [-d days_back] [-fn] ' +
+	    '[index_name]', cArg0);
+	process.exit(2);
+}
+
+function confirm(msg, callback)
+{
+	var answer = '';
+	process.stdout.write(msg);
+	process.stdin.resume();
+	process.stdin.setEncoding('utf8');
+	process.stdin.setRawMode(true);
+	process.stdin.on('data', function listener(ch) {
+		ch = ch + '';
+
+		switch (ch) {
+		case '\n':
+		case '\r':
+		case '\u0004':
+		        /* end of input line */
+		        process.stdin.setRawMode(false);
+		        process.stdin.pause();
+		        process.stdin.write('\n');
+			process.stdin.removeListener('data', listener);
+		        callback(answer == 'y');
+		        break;
+
+		case '\u0003':
+		        /* Ctrl-C */
+		        process.stdin.setRawMode(false);
+		        process.stdin.pause();
+			process.stdout.write('\n');
+			process.stdin.removeListener('data', listener);
+		        callback(false);
+		        break;
+
+		default:
+		        process.stdout.write(ch);
+		        answer += ch;
+		        break;
+		}
+	});
+}
+
+function checkIndex(indexdir, indexname, callback)
+{
+	var indexfile, idx;
+
+	if (!mod_jsprim.endsWith(indexname, '.json')) {
+		setImmediate(callback);
+		return;
+	}
+
+	indexfile = mod_path.join(indexdir, indexname);
+	mod_vasync.waterfall([
+	    function readFile(stepcb) {
+		mod_fs.readFile(indexfile, stepcb);
+	    },
+
+	    function parseFile(contents, stepcb) {
+		var parsed;
+		try {
+			parsed = JSON.parse(contents);
+		} catch (ex) {
+			stepcb(ex);
+			return;
+		}
+
+		idx = cIndexes[indexname] = {
+		    'i_conf': parsed,
+		    'i_found': {},
+		    'i_missing': []
+		};
+		stepcb();
+	    },
+
+	    function listIndexRoot(stepcb) {
+		var rpath = mod_path.join(idx.i_conf.indexroot, 'by_day');
+		cManta.ftw(rpath, function (err, emitter) {
+			if (err) {
+				/* Work around node-manta#198 */
+				if (!err.message)
+					err.message = err.name;
+				stepcb(err);
+				return;
+			}
+
+			emitter.on('entry', function (obj) {
+				idx.i_found[obj.name] = true;
+			});
+
+			emitter.on('end', function () { stepcb(); });
+		});
+	    },
+
+	    function findMissing(stepcb) {
+		idxFindMissing(idx);
+		stepcb();
+	    }
+	], function (err) {
+		callback(err);
+	});
+}
+
+function idxFindMissing(idx)
+{
+	var daysback, time, name, i;
+
+	daysback = cDaysBack;
+	time = new Date();
+	time.setUTCHours(0, 0, 0, 0);
+
+	for (i = 0; i < daysback; i++) {
+		time.setUTCDate(time.getUTCDate() - 1);
+		name = time.toISOString().substr(0, 10) + '.sqlite';
+		if (!idx.i_found.hasOwnProperty(name)) {
+			idx.i_missing.push({
+			    'name': name,
+			    'start': new Date(time.getTime())
+			});
+		}
+	}
+}
+
+function idxCompileWork(idxname, idx)
+{
+	console.error('index "%s": %d missing index%s',
+	    idxname, idx.i_missing.length,
+	    idx.i_missing.length == 1 ? '' : 'es');
+	idx.i_missing.forEach(function (missing) {
+		cWork.push({
+		    'w_idxname': idxname,
+		    'w_idx': idx,
+		    'w_name': missing.name,
+		    'w_start': missing.start,
+		    'w_cmd': idxWorkCommand(idx, missing)
+		});
+	});
+}
+
+function idxWorkCommand(idx, missing)
+{
+	var end, rv;
+
+	end = new Date(missing.start.getTime());
+	end.setUTCDate(end.getUTCDate() + 1);
+	rv = [ 'dn', 'index-manta', '--interval=day',
+	    format('--time-format=%s', idx.i_conf.timeformat),
+	    format('--after=%s', missing.start.toISOString()),
+	    format('--before=%s', end.toISOString()),
+	    format('--columns=%s', idx.i_conf.columns.join(',')) ];
+
+	if (idx.i_conf.filter)
+		rv.push('--filter=' + JSON.stringify(idx.i_conf.filter));
+
+	rv.push(idx.i_conf.dataroot);
+	rv.push(idx.i_conf.indexroot);
+
+	return (rv);
+}
+
+function doAllWork(dryrun, callback)
+{
+	var concurrency, worker, queue, errors;
+
+	concurrency = dryrun ? 1 : cJobConcurrency;
+	worker = function (w, queuecb) {
+		doOneJob(dryrun, w, function (err) {
+			if (err)
+				errors.push(err);
+			queuecb();
+		});
+	};
+	queue = mod_vasync.queue(worker, concurrency);
+	errors = [];
+	queue.on('end', function () {
+		if (errors.length > 0)
+			callback(errors[0]);
+		else
+			callback();
+	});
+
+	cWork.forEach(function (w) { queue.push(w); });
+	queue.close();
+}
+
+function doOneJob(dryrun, workinfo, callback)
+{
+	var p, l, stderr, jobid;
+
+	if (dryrun) {
+		console.log('    $ ' + workinfo.w_cmd.join(' '));
+		setImmediate(callback);
+		return;
+	}
+
+	p = mod_child.spawn(workinfo.w_cmd[0],
+	    workinfo.w_cmd.slice(1), {
+	        'stdio': [ 'ignore', 'ignore', 'pipe' ]
+	    });
+
+	p.on('error', function (err) {
+		callback(new VError(err, 'spawn "%s"',
+		    workinfo.w_cmd.join(' ')));
+	});
+
+	stderr = '';
+	l = new mod_lstream();
+	p.stderr.pipe(l);
+	l.on('data', function onData(line) {
+		var match;
+
+		/* JSSTYLED */
+		match = /submitted job (.*)/.exec(line);
+		if (match !== null) {
+			jobid = match[1];
+			console.error('index "%s" date "%s": %s',
+			    workinfo.w_idxname, workinfo.w_name,
+			    jobid);
+		}
+
+		stderr += line + '\n';
+	});
+
+	p.on('exit', function (code, signal) {
+		var reason, str;
+		if (code !== 0) {
+			reason = code === null ? 'signal ' + signal :
+			    'exited with status ' + code;
+			str = format('job "%s" failed (%s)',
+			    jobid ? jobid : '(unknown)', reason);
+			console.error(str);
+			console.error('stderr:');
+			process.stderr.write(stderr);
+			callback(new VError(str));
+		} else {
+			callback();
+		}
+	});
+}
+
+main();

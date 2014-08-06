@@ -1,0 +1,17 @@
+{
+	"dataroot": "/poseidon/stor/job_archives",
+	"indexroot": "/poseidon/stor/dragnet/marlin.jobs0",
+	"timeformat": "%Y/%m/%d/%H",
+	"columns": [
+	    "timestamp[aggr=lquantize,step=600,date,field=timeDone]",
+	    "worker",
+	    "auth.login",
+	    "stats.nErrors[aggr=quantize]",
+	    "stats.nRetries[aggr=quantize]",
+	    "stats.nInputsRead[aggr=quantize]",
+	    "stats.nJobOutputs[aggr=quantize]",
+	    "stats.nTasksDispatched[aggr=quantize]",
+	    "stats.nTasksCommittedOk[aggr=quantize]",
+	    "stats.nTasksCommittedFail[aggr=quantize]"
+	]
+}
