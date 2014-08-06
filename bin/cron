@@ -1,0 +1,4 @@
+#!/bin/bash
+
+export PATH=$PATH:$PWD/../dragnet/dragnet/bin
+$(dirname $BASH_SOURCE[0])/crank -d 1 -f
