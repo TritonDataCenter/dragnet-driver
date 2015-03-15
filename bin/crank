@@ -13,6 +13,7 @@ var mod_path = require('path');
 var mod_vasync = require('vasync');
 
 var format = require('util').format;
+var strsplit = require('strsplit');
 var VError = require('verror');
 
 var cArg0 = mod_path.basename(process.argv[1]);
@@ -21,11 +22,11 @@ var cWork = [];
 var cLog;
 var cManta;
 var cDaysBack = 7;
-var cJobConcurrency = 5;
+var cJobConcurrency = 3;
 
 function main()
 {
-	var option, parser, indexdir, indexname;
+	var option, parser, indexname;
 	var dryrun, noconfirm, v;
 
 	parser = new mod_getopt.BasicParser(
@@ -74,9 +75,11 @@ function main()
 		}
 
 		indexname = process.argv[parser.optind()];
+	} else {
+		console.error('%s: missing DATASOURCE_NAME', cArg0);
+		usage();
 	}
 
-	indexdir = mod_path.join(__dirname, '..', 'indexes');
 	cLog = new mod_bunyan({ 'name': cArg0 });
 	cManta = mod_manta.createBinClient({
 	    'log': cLog.child({ 'component': 'manta' })
@@ -85,37 +88,23 @@ function main()
 	process.removeAllListeners('uncaughtException');
 
 	crank({
-	    'indexdir': indexdir,
 	    'dryrun': dryrun,
 	    'noconfirm': noconfirm,
-	    'indexname': indexname || null
+	    'indexname': indexname
 	});
 }
 
 function crank(args)
 {
-	var indexdir, dryrun, noconfirm, indexname;
+	var dryrun, noconfirm, indexname;
 
-	indexdir = args.indexdir;
 	dryrun = args.dryrun;
 	noconfirm = args.noconfirm;
 	indexname = args.indexname;
 
 	mod_vasync.waterfall([
-	    function listLocalIndexes(callback) {
-		if (indexname === null)
-			mod_fs.readdir(indexdir, callback);
-		else
-			setImmediate(callback, null, [ indexname + '.json' ]);
-	    },
-
-	    function processIndexes(entries, callback) {
-		mod_vasync.forEachParallel({
-		    'func': checkIndex.bind(null, indexdir),
-		    'inputs': entries
-		}, function (err) {
-			callback(err);
-		});
+	    function doFetchIndexConfig(callback) {
+		checkIndex(indexname, callback);
 	    },
 
 	    function compileWork(callback) {
@@ -164,7 +153,7 @@ function fatal(err)
 function usage()
 {
 	console.error('usage: %s [-c concurrency] [-d days_back] [-fn] ' +
-	    '[index_name]', cArg0);
+	    'DATASOURCE_NAME', cArg0);
 	process.exit(2);
 }
 
@@ -207,40 +196,93 @@ function confirm(msg, callback)
 	});
 }
 
-function checkIndex(indexdir, indexname, callback)
+function checkIndex(dsname, callback)
 {
-	var indexfile, idx;
+	var idx;
 
-	if (!mod_jsprim.endsWith(indexname, '.json')) {
-		setImmediate(callback);
-		return;
-	}
-
-	indexfile = mod_path.join(indexdir, indexname);
 	mod_vasync.waterfall([
-	    function readFile(stepcb) {
-		mod_fs.readFile(indexfile, stepcb);
-	    },
+	    function getDatasourceConfig(stepcb) {
+		var execoptions = {
+		    'timeout': 10000,
+		    'killSignal': 'SIGKILL'
 
-	    function parseFile(contents, stepcb) {
-		var parsed;
-		try {
-			parsed = JSON.parse(contents);
-		} catch (ex) {
-			stepcb(ex);
-			return;
-		}
-
-		idx = cIndexes[indexname] = {
-		    'i_conf': parsed,
-		    'i_found': {},
-		    'i_missing': []
 		};
-		stepcb();
+		mod_child.execFile('dn', [ 'datasource-show', '-v', dsname ],
+		    execoptions, function (error, stdout, stderr) {
+			var err;
+
+			if (error) {
+				if (error.signal) {
+					err = new VError(error,
+					    'terminated by signal "%s"',
+					    error.signal);
+				} else if (typeof (error.code) == 'number') {
+					err = new VError(error,
+					    'command exited with code "%s"',
+					    error.code);
+				} else {
+					err = new VError(error, 'exec failed');
+				}
+
+				err = new VError(err, 'failed to fetch ' +
+				    'config for datasource "%s"', dsname);
+				stepcb(err);
+				return;
+			}
+
+			var lines, source, cfg, parts;
+
+			lines = stdout.split('\n');
+			lines.forEach(function (line) {
+				if (line.trim().length === 0) {
+					return;
+				}
+
+				if (line.charAt(0) !== ' ') {
+					source = line.split(/\s+/)[0];
+					if (source == dsname)
+						cfg = {};
+					return;
+				}
+
+				if (source != dsname) {
+					return;
+				}
+
+				parts = strsplit(line, /\s*:\s+/, 2);
+				if (parts.length != 2)
+					return;
+
+				cfg[parts[0].trim()] = parts[1].trim();
+			});
+
+			if (cfg === undefined || cfg.indexPath === undefined) {
+				stepcb(new VError('did not find datasource ' +
+				    'indexPath'));
+				return;
+			}
+
+			/*
+			 * Strip the surrounding quotation marks from the path.
+			 * XXX This is the point at which it's clear that we
+			 * shouldn't be parsing the human-readable output of "dn
+			 * datasource-show -v".
+			 */
+			cfg.indexPath = cfg.indexPath.substr(1,
+			    cfg.indexPath.length - 2);
+
+			idx = cIndexes[dsname] = {
+			    'i_dsname': dsname,
+			    'i_conf': cfg,
+			    'i_found': {},
+			    'i_missing': []
+			};
+			stepcb();
+		    });
 	    },
 
 	    function listIndexRoot(stepcb) {
-		var rpath = mod_path.join(idx.i_conf.indexroot, 'by_day');
+		var rpath = mod_path.join(idx.i_conf.indexPath, 'by_day');
 		cManta.ftw(rpath, function (err, emitter) {
 			if (err) {
 				/* Work around node-manta#198 */
@@ -309,18 +351,9 @@ function idxWorkCommand(idx, missing)
 
 	end = new Date(missing.start.getTime());
 	end.setUTCDate(end.getUTCDate() + 1);
-	rv = [ 'dn', 'index-manta', '--interval=day',
-	    format('--time-format=%s', idx.i_conf.timeformat),
+	rv = [ 'dn', 'build', idx.i_dsname,
 	    format('--after=%s', missing.start.toISOString()),
-	    format('--before=%s', end.toISOString()),
-	    format('--columns=%s', idx.i_conf.columns.join(',')) ];
-
-	if (idx.i_conf.filter)
-		rv.push('--filter=' + JSON.stringify(idx.i_conf.filter));
-
-	rv.push(idx.i_conf.dataroot);
-	rv.push(idx.i_conf.indexroot);
-
+	    format('--before=%s', end.toISOString()) ];
 	return (rv);
 }
 
