@@ -1,7 +1,9 @@
 #!/bin/bash
 
+root="$(dirname $BASH_SOURCE[0])/.."
+. $root/cron.sh
+
 start=$(date)
 echo "$start starting"
-export PATH=$PATH:$PWD/../dragnet/dragnet/bin
-$(dirname $BASH_SOURCE[0])/crank -d 2 -f
+$root/bin/crank -d 2 -f
 echo "$(date) done (started at $start)"
