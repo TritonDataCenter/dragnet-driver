@@ -5,5 +5,5 @@ root="$(dirname $BASH_SOURCE[0])/.."
 
 start=$(date)
 echo "$start starting"
-$root/bin/crank -d 2 -f muskie_logs
+$root/bin/crank -d 10 -f muskie_logs
 echo "$(date) done (started at $start)"

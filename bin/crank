@@ -22,7 +22,7 @@ var cWork = [];
 var cLog;
 var cManta;
 var cDaysBack = 7;
-var cJobConcurrency = 3;
+var cJobConcurrency = 1;
 
 function main()
 {
