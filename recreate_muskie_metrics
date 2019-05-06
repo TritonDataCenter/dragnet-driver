@@ -1,0 +1,48 @@
+#!/bin/bash
+
+shopt -s xpg_echo
+set -o pipefail
+
+function addmetric
+{
+	name="$1"
+	echo "adding metric \"$1\" ... \c "
+	if ! dn metric-add --datasource=muskie_logs "$@"; then
+		echo "FAILED"
+		exit 1
+	fi
+	echo "added"
+}
+
+echo "removing old metrics ... \c "
+if ! dn metric-list | awk /muskierq/'{ system("dn metric-remove " $2); }'; then
+	echo "FAILED"
+	exit 1
+fi
+echo "done"
+
+#
+# Simple metrics
+# Note: several of these are obviated by the composite ones below.
+#
+addmetric muskierq.by_hostname      -b timestamp[date,field=time,aggr=lquantize,step=60],hostname
+addmetric muskierq.by_method        -b timestamp[date,field=time,aggr=lquantize,step=60],req.method
+addmetric muskierq.by_operation     -b timestamp[date,field=time,aggr=lquantize,step=60],operation
+addmetric muskierq.by_caller        -b timestamp[date,field=time,aggr=lquantize,step=60],req.caller.login
+addmetric muskierq.by_owner         -b timestamp[date,field=time,aggr=lquantize,step=60],req.owner
+addmetric muskierq.by_status        -b timestamp[date,field=time,aggr=lquantize,step=60],res.statusCode
+addmetric muskierq.by_useragent     -b timestamp[date,field=time,aggr=lquantize,step=60],req.headers.user-agent
+
+# Composite metrics
+addmetric muskierq.by_hostname_method_status -b timestamp[date,field=time,aggr=lquantize,step=60],hostname,req.method,res.statusCode
+addmetric muskierq.by_method_caller -b timestamp[date,field=time,aggr=lquantize,step=60],req.method,req.caller.login
+addmetric muskierq.by_method_owner  -b timestamp[date,field=time,aggr=lquantize,step=60],req.method,req.owner
+addmetric muskierq.by_status_caller -b timestamp[date,field=time,aggr=lquantize,step=60],res.statusCode,req.caller.login
+addmetric muskierq.by_status_owner  -b timestamp[date,field=time,aggr=lquantize,step=60],res.statusCode,req.owner
+
+# Latency metrics
+addmetric muskierq.by_latency_method_hostname -b timestamp[date,field=time,aggr=lquantize,step=60],hostname,req.method,latency[aggr=quantize]
+addmetric muskierq.by_latency_operation       -b timestamp[date,field=time,aggr=lquantize,step=60],operation,latency[aggr=quantize]
+addmetric muskierq.by_method_latency1b        -b timestamp[date,field=time,aggr=lquantize,step=60],req.method,latencyToFirstByte[aggr=quantize] -f '{ "or": [ { "eq": [ "req.method", "GET" ] }, { "eq": [ "req.method", "PUT" ] } ] }'
+
+dn metric-list -v
